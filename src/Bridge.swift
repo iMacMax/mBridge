@@ -46,6 +46,8 @@ final class Bridge {
     private var lastSwitch = Date.distantPast
     private var cursorHidden = false
     private var moveQueued = false
+    private var pasteboardCount = NSPasteboard.general.changeCount
+    private var ignoreMovesUntil = Date.distantPast   // moving the Mac cursor ourselves reports a fake jump
 
     /// Shared secret: the PC remembers the first Mac that shows it and refuses every other one.
     private let key: String
@@ -71,6 +73,7 @@ final class Bridge {
     func start() {
         discovery.start { [weak self] peer in self?.found(peer) }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.watchClipboard() }
         tick()
     }
 
@@ -161,7 +164,8 @@ final class Bridge {
             connectedName = peers[id ?? ""]?.name ?? host
             status = "Connected to \(connectedName!)"
             learnSize(size)
-            newLink.listen(onLine: { _ in }, onClose: { [weak self, weak newLink] in
+            pasteboardCount = NSPasteboard.general.changeCount   // only copies made from now on are shared
+            newLink.listen(onLine: { [weak self] in self?.received($0) }, onClose: { [weak self, weak newLink] in
                 guard let self, let newLink else { return }
                 self.closed(newLink)
             })
@@ -216,6 +220,7 @@ final class Bridge {
         lastSwitch = Date()
         send("p \(Int(entry.x)) \(Int(entry.y))")
         let main = CGDisplayBounds(CGMainDisplayID())
+        ignoreMovesUntil = Date().addingTimeInterval(0.1)
         CGWarpMouseCursorPosition(CGPoint(x: main.midX, y: main.midY))   // park it mid-screen, away from Dock and hot corners
         setCursorHidden(true)
         onChange?()
@@ -226,6 +231,7 @@ final class Bridge {
         mode = .mac
         lastSwitch = Date()
         send("r")
+        ignoreMovesUntil = Date().addingTimeInterval(0.1)
         CGWarpMouseCursorPosition(point)
         setCursorHidden(false)
         onChange?()
@@ -248,6 +254,29 @@ final class Bridge {
         if mode == .pc { leavePC(to: returnPoint) }
         setCursorHidden(false)
         link?.finish()
+    }
+
+    // MARK: Clipboard
+
+    /// Text you copy here is sent to the PC. Copies marked as secret (password managers) are never sent.
+    private func watchClipboard() {
+        let board = NSPasteboard.general
+        guard board.changeCount != pasteboardCount else { return }
+        pasteboardCount = board.changeCount
+        let types = board.types?.map(\.rawValue) ?? []
+        guard link != nil, !types.contains("org.nspasteboard.ConcealedType"), !types.contains("org.nspasteboard.TransientType"),
+              let text = board.string(forType: .string), !text.isEmpty, text.utf8.count <= 256_000 else { return }
+        send("c " + Data(text.utf8).base64EncodedString())
+    }
+
+    /// Text copied on the PC arrives as "c <base64>".
+    private func received(_ line: String) {
+        guard line.hasPrefix("c "), let data = Data(base64Encoded: String(line.dropFirst(2))),
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text.replacingOccurrences(of: "\r\n", with: "\n"), forType: .string)
+        pasteboardCount = board.changeCount
     }
 
     // MARK: Events
@@ -316,6 +345,7 @@ final class Bridge {
     }
 
     private func move(by delta: CGPoint) {
+        guard Date() > ignoreMovesUntil else { return }
         let mac = macBounds()
         var next = CGPoint(x: pcPos.x + delta.x, y: pcPos.y + delta.y)
         if let back = arrangement.exit(from: next, mac: mac, pc: pcSize) {
@@ -356,3 +386,4 @@ final class Bridge {
         }
     }
 }
+

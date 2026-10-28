@@ -36,11 +36,15 @@ The first Mac to connect is remembered by the PC and any other Mac is turned awa
 
 Command is Ctrl on the PC (so ⌘C copies), Control is the Windows key, Option is Alt. Scrolling follows your Mac's scroll direction setting.
 
+## Clipboard
+
+Copy text on one machine and paste it on the other, whichever one you are using. Only text copied after connecting is shared.
+
 ## Notes
 
 - Same keyboard layout on both is assumed (keys are sent as physical keys).
 - Windows blocks input from normal programs to elevated windows, the lock screen and Ctrl+Alt+Del.
-- Clipboard and file sharing are not included.
+- Copied text is shared both ways. Copies marked secret by password managers are skipped. Images and files are not shared.
 - Rebuilding `mBridge.app` can make macOS forget its permissions. Remove and re-add it if switching stops working.
 - Your position is saved automatically.
 

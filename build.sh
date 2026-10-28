@@ -24,5 +24,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$APP"
+# A "mBridge Local Signing" certificate (see README) keeps macOS permissions across rebuilds; otherwise sign ad hoc.
+if security find-identity -p codesigning | grep -q "mBridge Local Signing"; then
+    codesign --force --sign "mBridge Local Signing" "$APP"
+else
+    codesign --force --sign - "$APP"
+fi
 echo "Built $APP"

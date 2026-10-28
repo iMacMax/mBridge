@@ -22,6 +22,7 @@ static class Native
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
 }
 
 class Input
@@ -97,6 +98,8 @@ class App : ApplicationContext
     readonly Input input = new Input();
     readonly object writeLock = new object();
     TcpClient current;
+    NetworkStream currentStream;
+    uint clipboardSeq;
 
     public App()
     {
@@ -120,6 +123,12 @@ class App : ApplicationContext
         tray.Icon = MonitorIcon();
         tray.Text = "mBridge";
         tray.Visible = true;
+
+        clipboardSeq = Native.GetClipboardSequenceNumber();
+        System.Windows.Forms.Timer clipboardTimer = new System.Windows.Forms.Timer();
+        clipboardTimer.Interval = 300;
+        clipboardTimer.Tick += delegate { WatchClipboard(); };
+        clipboardTimer.Start();
 
         Thread listen = new Thread(Listen); listen.IsBackground = true; listen.Start();
         Thread beacon = new Thread(Beacon); beacon.IsBackground = true; beacon.Start();
@@ -160,6 +169,43 @@ class App : ApplicationContext
         {
             if (on) k.SetValue("mBridge", "\"" + Application.ExecutablePath + "\""); else k.DeleteValue("mBridge", false);
         }
+    }
+
+    // MARK: clipboard
+
+    /// Text copied here is sent to the Mac. Copies marked as secret (password managers) are never sent.
+    void WatchClipboard()
+    {
+        uint seq = Native.GetClipboardSequenceNumber();
+        if (seq == clipboardSeq) return;
+        clipboardSeq = seq;
+        NetworkStream stream = currentStream;
+        if (stream == null) return;
+        try
+        {
+            if (!Clipboard.ContainsText() || Clipboard.ContainsData("ExcludeClipboardContentFromMonitorProcessing")) return;
+            string text = Clipboard.GetText();
+            if (text.Length == 0 || text.Length > 256000) return;
+            Send(stream, "c " + Convert.ToBase64String(Encoding.UTF8.GetBytes(text.Replace("\r\n", "\n"))));
+        }
+        catch { }
+    }
+
+    /// Text copied on the Mac arrives as "c <base64>".
+    void SetClipboard(string base64)
+    {
+        string text;
+        try { text = Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch { return; }
+        if (text.Length == 0) return;
+        ui.Post(delegate
+        {
+            try
+            {
+                Clipboard.SetDataObject(text.Replace("\r\n", "\n").Replace("\n", "\r\n"), true, 5, 100);
+                clipboardSeq = Native.GetClipboardSequenceNumber();
+            }
+            catch { }
+        }, null);
     }
 
     // MARK: network
@@ -244,6 +290,7 @@ class App : ApplicationContext
 
             TcpClient previous = current;
             current = client;
+            currentStream = stream;
             if (previous != null) { try { previous.Close(); } catch { } }
 
             Send(stream, "ok " + Input.Width + " " + Input.Height);
@@ -253,7 +300,8 @@ class App : ApplicationContext
             string line;
             while ((line = reader.ReadLine()) != null)
             {
-                if (line.Length > 1) { try { input.Apply(line); } catch { } }
+                if (line.StartsWith("c ")) SetClipboard(line.Substring(2));
+                else if (line.Length > 1) { try { input.Apply(line); } catch { } }
             }
         }
         catch { }
@@ -261,7 +309,7 @@ class App : ApplicationContext
         {
             if (heartbeat != null) heartbeat.Dispose();
             input.ReleaseAll();
-            if (current == client) { current = null; SetStatus("Waiting for a Mac…"); }
+            if (current == client) { current = null; currentStream = null; SetStatus("Waiting for a Mac…"); }
             try { client.Close(); } catch { }
         }
     }
