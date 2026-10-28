@@ -150,7 +150,7 @@ class App : ApplicationContext
 
     readonly NotifyIcon tray = new NotifyIcon();
     readonly ToolStripMenuItem status = new ToolStripMenuItem("Waiting for a Mac…");
-    readonly SynchronizationContext ui = SynchronizationContext.Current;
+    readonly Control ui = new Control();   // other threads hand work to the window thread through this
     readonly string keyFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mBridge", "paired.txt");
     readonly Input input = new Input();
     readonly object writeLock = new object();
@@ -160,6 +160,7 @@ class App : ApplicationContext
 
     public App()
     {
+        IntPtr handle = ui.Handle;             // creates the window on this thread, so BeginInvoke has somewhere to go
         status.Enabled = false;
         ToolStripMenuItem login = new ToolStripMenuItem("Open at Login");
         login.Checked = LoginEnabled();
@@ -200,7 +201,7 @@ class App : ApplicationContext
 
     // MARK: tray
 
-    void SetStatus(string text) { ui.Post(delegate { status.Text = text; }, null); }
+    void SetStatus(string text) { ui.BeginInvoke((MethodInvoker)delegate { status.Text = text; }); }
 
     static Icon MonitorIcon()
     {
@@ -235,6 +236,18 @@ class App : ApplicationContext
         }
     }
 
+    /// Problems go to %LOCALAPPDATA%\mBridge\log.txt, so they can be looked at later.
+    static void Log(string message)
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "mBridge");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "log.txt"), DateTime.Now.ToString("s") + " " + message + "\r\n");
+        }
+        catch { }
+    }
+
     // MARK: clipboard
 
     /// Text copied here is sent to the Mac. Copies marked as secret (password managers) are never sent.
@@ -261,15 +274,15 @@ class App : ApplicationContext
         string text;
         try { text = Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch { return; }
         if (text.Length == 0) return;
-        ui.Post(delegate
+        ui.BeginInvoke((MethodInvoker)delegate
         {
             try
             {
-                Clipboard.SetDataObject(text.Replace("\r\n", "\n").Replace("\n", "\r\n"), true, 5, 100);
+                Clipboard.SetDataObject(text.Replace("\r\n", "\n").Replace("\n", "\r\n"), true, 10, 100);
                 clipboardSeq = Native.GetClipboardSequenceNumber();
             }
-            catch { }
-        }, null);
+            catch (Exception e) { Log("clipboard: " + e.Message); }
+        });
     }
 
     // MARK: network
