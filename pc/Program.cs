@@ -1,0 +1,284 @@
+using System;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+// mBridge for PC: a monitor icon in the system tray. A Mac running mBridge finds this PC on the
+// network and uses its keyboard and mouse to control it. Built with the C# compiler that ships with Windows.
+
+static class Native
+{
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+}
+
+class Input
+{
+    const uint LeftDown = 0x2, LeftUp = 0x4, RightDown = 0x8, RightUp = 0x10, MiddleDown = 0x20, MiddleUp = 0x40;
+    const uint XDown = 0x80, XUp = 0x100, Wheel = 0x800, HWheel = 0x1000, KeyUp = 0x2, Extended = 0x1;
+
+    readonly System.Collections.Generic.HashSet<int> keys = new System.Collections.Generic.HashSet<int>();
+    readonly System.Collections.Generic.HashSet<int> buttons = new System.Collections.Generic.HashSet<int>();
+
+    public static int Width { get { return Native.GetSystemMetrics(0); } }
+    public static int Height { get { return Native.GetSystemMetrics(1); } }
+
+    public void Apply(string line)
+    {
+        string[] f = line.Split(' ');
+        switch (f[0])
+        {
+            case "p": Native.SetCursorPos(Int(f[1]), Int(f[2])); break;
+            case "b": Button(Int(f[1]), Int(f[2]) == 1); break;
+            case "w": Scroll(Int(f[1]), Int(f[2])); break;
+            case "k": Key(Int(f[1]), Int(f[2]) == 1, Int(f[3]) == 1); break;
+            case "r": ReleaseAll(); break;
+        }
+    }
+
+    static int Int(string s) { return int.Parse(s, CultureInfo.InvariantCulture); }
+
+    void Button(int number, bool down)
+    {
+        if (down) buttons.Add(number); else buttons.Remove(number);
+        switch (number)
+        {
+            case 0: Native.mouse_event(down ? LeftDown : LeftUp, 0, 0, 0, UIntPtr.Zero); break;
+            case 1: Native.mouse_event(down ? RightDown : RightUp, 0, 0, 0, UIntPtr.Zero); break;
+            case 2: Native.mouse_event(down ? MiddleDown : MiddleUp, 0, 0, 0, UIntPtr.Zero); break;
+            case 3: Native.mouse_event(down ? XDown : XUp, 0, 0, 1, UIntPtr.Zero); break;   // back
+            case 4: Native.mouse_event(down ? XDown : XUp, 0, 0, 2, UIntPtr.Zero); break;   // forward
+        }
+    }
+
+    // The Mac sends scroll distance in pixels; about 10 pixels is one notch of the wheel.
+    void Scroll(int dx, int dy)
+    {
+        if (dy != 0) Native.mouse_event(Wheel, 0, 0, dy * 12, UIntPtr.Zero);
+        if (dx != 0) Native.mouse_event(HWheel, 0, 0, -dx * 12, UIntPtr.Zero);
+    }
+
+    void Key(int vk, bool extended, bool down)
+    {
+        int id = vk | (extended ? 0x100 : 0);
+        if (down) keys.Add(id); else keys.Remove(id);
+        uint flags = (extended ? Extended : 0) | (down ? 0 : KeyUp);
+        Native.keybd_event((byte)vk, (byte)Native.MapVirtualKey((uint)vk, 0), flags, UIntPtr.Zero);
+    }
+
+    /// Lets go of everything still held, so a key or button never gets stuck when the Mac leaves.
+    public void ReleaseAll()
+    {
+        foreach (int id in new System.Collections.Generic.List<int>(keys)) Key(id & 0xFF, (id & 0x100) != 0, false);
+        foreach (int b in new System.Collections.Generic.List<int>(buttons)) Button(b, false);
+    }
+}
+
+class App : ApplicationContext
+{
+    const int BeaconPort = 24801, ListenPort = 24802;
+
+    readonly NotifyIcon tray = new NotifyIcon();
+    readonly ToolStripMenuItem status = new ToolStripMenuItem("Waiting for a Mac…");
+    readonly SynchronizationContext ui = SynchronizationContext.Current;
+    readonly string keyFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mBridge", "paired.txt");
+    readonly Input input = new Input();
+    readonly object writeLock = new object();
+    TcpClient current;
+
+    public App()
+    {
+        status.Enabled = false;
+        ToolStripMenuItem login = new ToolStripMenuItem("Open at Login");
+        login.Checked = LoginEnabled();
+        login.Click += delegate { SetLogin(!LoginEnabled()); login.Checked = LoginEnabled(); };
+        ToolStripMenuItem forget = new ToolStripMenuItem("Forget Paired Mac");
+        forget.Click += delegate { try { File.Delete(keyFile); } catch { } SetStatus("Waiting for a Mac…"); };
+        ToolStripMenuItem quit = new ToolStripMenuItem("Quit mBridge");
+        quit.Click += delegate { input.ReleaseAll(); tray.Visible = false; Application.Exit(); };
+
+        ContextMenuStrip menu = new ContextMenuStrip();
+        menu.Items.Add(status);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(login);
+        menu.Items.Add(forget);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(quit);
+        tray.ContextMenuStrip = menu;
+        tray.Icon = MonitorIcon();
+        tray.Text = "mBridge";
+        tray.Visible = true;
+
+        Thread listen = new Thread(Listen); listen.IsBackground = true; listen.Start();
+        Thread beacon = new Thread(Beacon); beacon.IsBackground = true; beacon.Start();
+    }
+
+    // MARK: tray
+
+    void SetStatus(string text) { ui.Post(delegate { status.Text = text; }, null); }
+
+    static Icon MonitorIcon()
+    {
+        bool light = true;
+        try { light = (int)Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "SystemUsesLightTheme", 1) == 1; } catch { }
+        Color ink = light ? Color.Black : Color.White;
+        Bitmap bmp = new Bitmap(32, 32);
+        using (Graphics g = Graphics.FromImage(bmp))
+        using (Pen pen = new Pen(ink, 3))
+        using (Brush brush = new SolidBrush(ink))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.DrawRectangle(pen, 3, 5, 25, 17);
+            g.FillRectangle(brush, 14, 22, 4, 4);
+            g.FillRectangle(brush, 9, 26, 14, 3);
+        }
+        return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    static bool LoginEnabled()
+    {
+        using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey)) { return k != null && k.GetValue("mBridge") != null; }
+    }
+
+    static void SetLogin(bool on)
+    {
+        using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+        {
+            if (on) k.SetValue("mBridge", "\"" + Application.ExecutablePath + "\""); else k.DeleteValue("mBridge", false);
+        }
+    }
+
+    // MARK: network
+
+    /// Shouts "I'm here" once a second so the Mac can find this PC without any setup.
+    void Beacon()
+    {
+        UdpClient udp = new UdpClient();
+        udp.EnableBroadcast = true;
+        while (true)
+        {
+            try
+            {
+                string text = "mBridge|" + Environment.MachineName + "|" + Environment.MachineName + "|" + Input.Width + "|" + Input.Height + "|" + ListenPort;
+                byte[] data = Encoding.UTF8.GetBytes(text);
+                udp.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, BeaconPort));
+                foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                    foreach (UnicastIPAddressInformation ua in nic.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != AddressFamily.InterNetwork || ua.IPv4Mask == null) continue;
+                        byte[] a = ua.Address.GetAddressBytes(), m = ua.IPv4Mask.GetAddressBytes(), b = new byte[4];
+                        for (int i = 0; i < 4; i++) b[i] = (byte)(a[i] | ~m[i]);
+                        udp.Send(data, data.Length, new IPEndPoint(new IPAddress(b), BeaconPort));
+                    }
+                }
+            }
+            catch { }
+            Thread.Sleep(1000);
+        }
+    }
+
+    void Listen()
+    {
+        TcpListener listener = new TcpListener(IPAddress.Any, ListenPort);
+        try { listener.Start(); }
+        catch { SetStatus("Port " + ListenPort + " is in use"); return; }
+        while (true)
+        {
+            TcpClient client;
+            try { client = listener.AcceptTcpClient(); } catch { continue; }
+            Thread t = new Thread(delegate () { Serve(client); });
+            t.IsBackground = true;
+            t.Start();
+        }
+    }
+
+    void Send(NetworkStream stream, string line)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(line + "\n");
+        lock (writeLock) { stream.Write(bytes, 0, bytes.Length); }
+    }
+
+    void Serve(TcpClient client)
+    {
+        System.Threading.Timer heartbeat = null;
+        try
+        {
+            client.NoDelay = true;
+            client.ReceiveTimeout = 5000;   // the Mac sends "." every second
+            NetworkStream stream = client.GetStream();
+            StreamReader reader = new StreamReader(stream, Encoding.UTF8);
+
+            string[] hello = (reader.ReadLine() ?? "").Split(new char[] { ' ' }, 3);
+            if (hello.Length < 3 || hello[0] != "hi") return;
+
+            // The first Mac to connect is remembered; any other Mac is turned away until "Forget Paired Mac".
+            string saved = null;
+            try { saved = File.ReadAllText(keyFile).Trim(); } catch { }
+            if (saved == null || saved.Length == 0)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(keyFile));
+                File.WriteAllText(keyFile, hello[1]);
+            }
+            else if (saved != hello[1])
+            {
+                Send(stream, "deny");
+                SetStatus("Turned away " + hello[2] + " (not paired)");
+                return;
+            }
+
+            TcpClient previous = current;
+            current = client;
+            if (previous != null) { try { previous.Close(); } catch { } }
+
+            Send(stream, "ok " + Input.Width + " " + Input.Height);
+            SetStatus("Connected to " + hello[2]);
+            heartbeat = new System.Threading.Timer(delegate { try { Send(stream, "."); } catch { } }, null, 1000, 1000);
+
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (line.Length > 1) { try { input.Apply(line); } catch { } }
+            }
+        }
+        catch { }
+        finally
+        {
+            if (heartbeat != null) heartbeat.Dispose();
+            input.ReleaseAll();
+            if (current == client) { current = null; SetStatus("Waiting for a Mac…"); }
+            try { client.Close(); } catch { }
+        }
+    }
+}
+
+static class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        bool first;
+        using (Mutex one = new Mutex(true, "mBridgePC", out first))
+        {
+            if (!first) return;
+            Native.SetProcessDPIAware();   // real pixels, so the cursor lands where the Mac says
+            Application.EnableVisualStyles();
+            Application.Run(new App());
+        }
+    }
+}
