@@ -264,15 +264,17 @@ class App : ApplicationContext
             string text = Clipboard.GetText();
             if (text.Length == 0 || text.Length > 256000) return;
             Send(stream, "c " + Convert.ToBase64String(Encoding.UTF8.GetBytes(text.Replace("\r\n", "\n"))));
+            Log("clipboard sent to Mac: " + text.Length + " characters");
         }
-        catch { }
+        catch (Exception e) { Log("clipboard send: " + e.Message); }
     }
 
     /// Text copied on the Mac arrives as "c <base64>".
     void SetClipboard(string base64)
     {
         string text;
-        try { text = Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch { return; }
+        try { text = Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch (Exception e) { Log("clipboard from Mac unreadable: " + e.Message); return; }
+        Log("clipboard from Mac: " + text.Length + " characters");
         if (text.Length == 0) return;
         ui.BeginInvoke((MethodInvoker)delegate
         {
@@ -280,6 +282,7 @@ class App : ApplicationContext
             {
                 Clipboard.SetDataObject(text.Replace("\r\n", "\n").Replace("\n", "\r\n"), true, 10, 100);
                 clipboardSeq = Native.GetClipboardSequenceNumber();
+                Log("clipboard set");
             }
             catch (Exception e) { Log("clipboard: " + e.Message); }
         });
