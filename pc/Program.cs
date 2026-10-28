@@ -23,6 +23,56 @@ static class Native
     [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern IntPtr CreateCursor(IntPtr inst, int xHot, int yHot, int w, int h, byte[] andMask, byte[] xorMask);
+    [DllImport("user32.dll")] public static extern bool SetSystemCursor(IntPtr cursor, uint id);
+    [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint action, uint param, IntPtr pv, uint winIni);
+}
+
+[StructLayout(LayoutKind.Sequential)]
+struct POINT { public int X, Y; }
+
+/// Hides the mouse cursor everywhere by swapping every system cursor for a see-through one,
+/// and puts the real ones back with Show(). Windows has no simpler way to hide it system-wide.
+static class CursorHider
+{
+    static readonly uint[] ids = { 32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650, 32651 };
+    static readonly object gate = new object();
+    static bool hidden;
+    public static int LastX, LastY;   // where the Mac last put the cursor
+
+    public static bool IsHidden { get { lock (gate) { return hidden; } } }
+
+    public static void Hide()
+    {
+        lock (gate)
+        {
+            if (hidden) return;
+            hidden = true;
+            POINT here;
+            if (Native.GetCursorPos(out here)) { LastX = here.X; LastY = here.Y; }   // movement from now on is the PC's own mouse
+            byte[] andMask = new byte[128], xorMask = new byte[128];
+            for (int i = 0; i < andMask.Length; i++) andMask[i] = 0xFF;
+            foreach (uint id in ids) Native.SetSystemCursor(Native.CreateCursor(IntPtr.Zero, 0, 0, 32, 32, andMask, xorMask), id);
+        }
+    }
+
+    public static void Show()
+    {
+        lock (gate)
+        {
+            hidden = false;
+            Native.SystemParametersInfo(0x57, 0, IntPtr.Zero, 0);   // SPI_SETCURSORS: reload the user's cursors
+        }
+    }
+
+    /// True when the PC's own mouse moved the cursor since the Mac last placed it.
+    public static bool MovedByUser()
+    {
+        POINT p;
+        if (!Native.GetCursorPos(out p)) return false;
+        return Math.Abs(p.X - LastX) > 3 || Math.Abs(p.Y - LastY) > 3;
+    }
 }
 
 class Input
@@ -41,12 +91,19 @@ class Input
         string[] f = line.Split(' ');
         switch (f[0])
         {
-            case "p": Native.SetCursorPos(Int(f[1]), Int(f[2])); break;
+            case "p": MoveCursor(Int(f[1]), Int(f[2])); break;
             case "b": Button(Int(f[1]), Int(f[2]) == 1); break;
             case "w": Scroll(Int(f[1]), Int(f[2])); break;
             case "k": Key(Int(f[1]), Int(f[2]) == 1, Int(f[3]) == 1); break;
             case "r": ReleaseAll(); break;
         }
+    }
+
+    static void MoveCursor(int x, int y)
+    {
+        CursorHider.LastX = x;
+        CursorHider.LastY = y;
+        Native.SetCursorPos(x, y);
     }
 
     static int Int(string s) { return int.Parse(s, CultureInfo.InvariantCulture); }
@@ -110,7 +167,7 @@ class App : ApplicationContext
         ToolStripMenuItem forget = new ToolStripMenuItem("Forget Paired Mac");
         forget.Click += delegate { try { File.Delete(keyFile); } catch { } SetStatus("Waiting for a Mac…"); };
         ToolStripMenuItem quit = new ToolStripMenuItem("Quit mBridge");
-        quit.Click += delegate { input.ReleaseAll(); tray.Visible = false; Application.Exit(); };
+        quit.Click += delegate { input.ReleaseAll(); CursorHider.Show(); tray.Visible = false; Application.Exit(); };
 
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add(status);
@@ -129,6 +186,13 @@ class App : ApplicationContext
         clipboardTimer.Interval = 300;
         clipboardTimer.Tick += delegate { WatchClipboard(); };
         clipboardTimer.Start();
+
+        CursorHider.Show();   // a crashed run could have left the cursors hidden
+        System.Windows.Forms.Timer userMouse = new System.Windows.Forms.Timer();
+        userMouse.Interval = 100;
+        userMouse.Tick += delegate { if (CursorHider.IsHidden && CursorHider.MovedByUser()) CursorHider.Show(); };
+        userMouse.Start();
+        AppDomain.CurrentDomain.ProcessExit += delegate { CursorHider.Show(); };
 
         Thread listen = new Thread(Listen); listen.IsBackground = true; listen.Start();
         Thread beacon = new Thread(Beacon); beacon.IsBackground = true; beacon.Start();
@@ -300,8 +364,11 @@ class App : ApplicationContext
             string line;
             while ((line = reader.ReadLine()) != null)
             {
+                if (line == ".") continue;
                 if (line.StartsWith("c ")) SetClipboard(line.Substring(2));
-                else if (line.Length > 1) { try { input.Apply(line); } catch { } }
+                else if (line == "hide") CursorHider.Hide();
+                else if (line == "show") CursorHider.Show();
+                else { try { input.Apply(line); } catch { } }
             }
         }
         catch { }
@@ -309,6 +376,7 @@ class App : ApplicationContext
         {
             if (heartbeat != null) heartbeat.Dispose();
             input.ReleaseAll();
+            if (current == client) CursorHider.Show();
             if (current == client) { current = null; currentStream = null; SetStatus("Waiting for a Mac…"); }
             try { client.Close(); } catch { }
         }

@@ -56,21 +56,17 @@ struct Arrangement: Codable, Equatable {
         let r = pcRect(mac: mac, pc: pc)
         switch side {
         case .right:
-            let y = v.y + r.minY
-            guard v.x < 0, y >= mac.minY, y < mac.maxY else { return nil }
-            return CGPoint(x: mac.maxX - 3, y: y)
+            guard v.x < 0 else { return nil }
+            return CGPoint(x: mac.maxX - 3, y: clamp(v.y + r.minY, mac.minY + 3, mac.maxY - 3))
         case .left:
-            let y = v.y + r.minY
-            guard v.x > pc.width - 1, y >= mac.minY, y < mac.maxY else { return nil }
-            return CGPoint(x: mac.minX + 3, y: y)
+            guard v.x > pc.width - 1 else { return nil }
+            return CGPoint(x: mac.minX + 3, y: clamp(v.y + r.minY, mac.minY + 3, mac.maxY - 3))
         case .below:
-            let x = v.x + r.minX
-            guard v.y < 0, x >= mac.minX, x < mac.maxX else { return nil }
-            return CGPoint(x: x, y: mac.maxY - 3)
+            guard v.y < 0 else { return nil }
+            return CGPoint(x: clamp(v.x + r.minX, mac.minX + 3, mac.maxX - 3), y: mac.maxY - 3)
         case .above:
-            let x = v.x + r.minX
-            guard v.y > pc.height - 1, x >= mac.minX, x < mac.maxX else { return nil }
-            return CGPoint(x: x, y: mac.minY + 3)
+            guard v.y > pc.height - 1 else { return nil }
+            return CGPoint(x: clamp(v.x + r.minX, mac.minX + 3, mac.maxX - 3), y: mac.minY + 3)
         }
     }
 
@@ -80,6 +76,8 @@ struct Arrangement: Codable, Equatable {
         return Arrangement(side: side, offset: horizontal ? (mac.height - pc.height) / 2 : (mac.width - pc.width) / 2)
     }
 }
+
+private func clamp(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { min(max(v, lo), hi) }
 
 /// All Mac displays together, in global top-left coordinates.
 func macBounds() -> CGRect {

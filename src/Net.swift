@@ -78,6 +78,8 @@ final class Link {
     private let fd: Int32
     private var hungUp = false
     private var released = false
+    private let lock = NSLock()
+    private let writer = DispatchQueue(label: "mBridge.link.writer")
 
     private init(fd: Int32) { self.fd = fd }
 
@@ -138,31 +140,45 @@ final class Link {
         return nil
     }
 
-    /// Main thread only. A failed write closes the link, which the reader then reports.
+    /// Writes on a background queue, in order, so a slow network can never freeze the Mac's mouse and keyboard.
+    /// A failed write closes the link, which the reader then reports.
     func send(_ line: String) {
-        guard !hungUp else { return }
         let bytes = Array((line + "\n").utf8)
-        var sent = 0
-        while sent < bytes.count {
-            let n = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress! + sent, bytes.count - sent) }
-            if n < 0 && errno == EINTR { continue }
-            if n <= 0 { hangUp(); return }
-            sent += n
+        writer.async { [self] in
+            guard !isHungUp else { return }
+            var sent = 0
+            while sent < bytes.count {
+                let n = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress! + sent, bytes.count - sent) }
+                if n < 0 && errno == EINTR { continue }
+                if n <= 0 { hangUp(); return }
+                sent += n
+            }
         }
     }
 
     /// Makes the reader stop; `finish()` then frees the socket.
     func hangUp() {
+        lock.lock()
+        defer { lock.unlock() }
         guard !hungUp else { return }
         hungUp = true
         shutdown(fd, SHUT_RDWR)
     }
 
+    private var isHungUp: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hungUp
+    }
+
     func finish() {
         hangUp()
-        guard !released else { return }
-        released = true
-        Darwin.close(fd)
+        // close only after queued writes are done, so the socket number can't be reused under them
+        writer.async { [self] in
+            guard !released else { return }
+            released = true
+            Darwin.close(fd)
+        }
     }
 
     /// Reads lines on a background thread and reports them on the main thread.

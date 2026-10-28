@@ -22,6 +22,7 @@ let eventTypes: [CGEventType] = [
 let callback: CGEventTapCallBack = { _, type, event, _ in
     switch type {
     case .tapDisabledByTimeout, .tapDisabledByUserInput:
+        bridge.failsafe()
         if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
     default:
         if bridge.handle(type, event) { return nil }

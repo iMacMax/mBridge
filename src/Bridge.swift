@@ -71,6 +71,7 @@ final class Bridge {
     }
 
     func start() {
+        CGAssociateMouseAndMouseCursorPosition(1)   // in case an earlier run left the cursor frozen
         discovery.start { [weak self] peer in self?.found(peer) }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.watchClipboard() }
@@ -88,6 +89,7 @@ final class Bridge {
 
     private func tick() {
         link?.send(".")
+        if mode == .pc, link == nil { leavePC(to: returnPoint) }
         let before = peers.count
         peers = peers.filter { Date().timeIntervalSince($0.value.seen) < 5 }
         if link == nil, !connecting {
@@ -164,6 +166,7 @@ final class Bridge {
             connectedName = peers[id ?? ""]?.name ?? host
             status = "Connected to \(connectedName!)"
             learnSize(size)
+            newLink.send("hide")   // the PC's cursor stays out of sight until you cross over
             pasteboardCount = NSPasteboard.general.changeCount   // only copies made from now on are shared
             newLink.listen(onLine: { [weak self] in self?.received($0) }, onClose: { [weak self, weak newLink] in
                 guard let self, let newLink else { return }
@@ -218,11 +221,15 @@ final class Bridge {
         pcPos = entry
         mode = .pc
         lastSwitch = Date()
+        send("show")
         send("p \(Int(entry.x)) \(Int(entry.y))")
+        // Hide first, then park the cursor mid-screen (away from the Dock and hot corners) and freeze it:
+        // swallowing mouse events does not stop macOS from moving the cursor, only this does.
+        setCursorHidden(true)
         let main = CGDisplayBounds(CGMainDisplayID())
         ignoreMovesUntil = Date().addingTimeInterval(0.1)
-        CGWarpMouseCursorPosition(CGPoint(x: main.midX, y: main.midY))   // park it mid-screen, away from Dock and hot corners
-        setCursorHidden(true)
+        CGWarpMouseCursorPosition(CGPoint(x: main.midX, y: main.midY))
+        CGAssociateMouseAndMouseCursorPosition(0)
         onChange?()
     }
 
@@ -231,6 +238,8 @@ final class Bridge {
         mode = .mac
         lastSwitch = Date()
         send("r")
+        send("hide")
+        CGAssociateMouseAndMouseCursorPosition(1)
         ignoreMovesUntil = Date().addingTimeInterval(0.1)
         CGWarpMouseCursorPosition(point)
         setCursorHidden(false)
@@ -250,8 +259,14 @@ final class Bridge {
         }
     }
 
+    /// The event listener was switched off by macOS: never stay on the PC with the keyboard and mouse stuck there.
+    func failsafe() {
+        if mode == .pc { leavePC(to: returnPoint) }
+    }
+
     func shutDown() {
         if mode == .pc { leavePC(to: returnPoint) }
+        CGAssociateMouseAndMouseCursorPosition(1)
         setCursorHidden(false)
         link?.finish()
     }
