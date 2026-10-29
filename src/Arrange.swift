@@ -93,7 +93,8 @@ final class ArrangeView: NSView {
         let keep = min(macLen, pcLen) / 3   // the screens must still share part of the edge
         var offset = min(max(along, -pcLen + keep), macLen - keep)
         for aligned in [0, (macLen - pcLen) / 2, macLen - pcLen] where abs(offset - aligned) < 12 / scale { offset = aligned }
-        return Arrangement(side: side, offset: Double(offset))
+        let centered = abs(offset - (macLen - pcLen) / 2) < 1   // centered screens line up by proportion
+        return Arrangement(side: side, offset: Double(offset), lined: centered)
     }
 }
 

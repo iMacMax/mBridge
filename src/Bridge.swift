@@ -36,7 +36,7 @@ final class Bridge {
     private var targetKey: String { connectedID ?? lastPeerID ?? "default" }
 
     var arrangement: Arrangement {
-        get { arrangements[targetKey] ?? arrangements["default"] ?? .standard }
+        get { arrangements[targetKey] ?? arrangements["default"] ?? Arrangement.standard.centered(mac: macBounds().size, pc: pcSize) }
         set {
             arrangements[targetKey] = newValue
             if let data = try? JSONEncoder().encode(arrangements) { defaults.set(data, forKey: "arrangements") }

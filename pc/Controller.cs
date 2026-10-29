@@ -27,11 +27,13 @@ class Arrangement
 {
     public Side Side = Side.Right;
     public double Offset;   // how far the other screen is shifted along the shared edge, from this screen's top or left
+    public bool Lined = true;   // centered: lined up by proportion, so the cursor crosses at the same relative position
 
     public static Arrangement Centered(Side side, SizeF me, SizeF other)
     {
         Arrangement a = new Arrangement();
         a.Side = side;
+        a.Lined = true;
         bool horizontal = side == Side.Left || side == Side.Right;
         a.Offset = horizontal ? (me.Height - other.Height) / 2 : (me.Width - other.Width) / 2;
         return a;
@@ -53,24 +55,26 @@ class Arrangement
     public bool Entry(Point p, int dx, int dy, RectangleF me, SizeF other, out PointF entry)
     {
         RectangleF r = OtherRect(me, other);
+        bool lined = Lined;
+        float fy = (p.Y - me.Top) / me.Height, fx = (p.X - me.Left) / me.Width;   // how far along the edge, 0...1
         entry = PointF.Empty;
         switch (Side)
         {
             case Side.Right:
-                if (p.X < me.Right - 1 || dx <= 0 || p.Y < r.Top || p.Y >= r.Bottom) return false;
-                entry = new PointF(0, p.Y - r.Top);
+                if (p.X < me.Right - 1 || dx <= 0 || (!lined && (p.Y < r.Top || p.Y >= r.Bottom))) return false;
+                entry = new PointF(0, lined ? fy * other.Height : p.Y - r.Top);
                 return true;
             case Side.Left:
-                if (p.X > me.Left + 1 || dx >= 0 || p.Y < r.Top || p.Y >= r.Bottom) return false;
-                entry = new PointF(other.Width - 1, p.Y - r.Top);
+                if (p.X > me.Left + 1 || dx >= 0 || (!lined && (p.Y < r.Top || p.Y >= r.Bottom))) return false;
+                entry = new PointF(other.Width - 1, lined ? fy * other.Height : p.Y - r.Top);
                 return true;
             case Side.Below:
-                if (p.Y < me.Bottom - 1 || dy <= 0 || p.X < r.Left || p.X >= r.Right) return false;
-                entry = new PointF(p.X - r.Left, 0);
+                if (p.Y < me.Bottom - 1 || dy <= 0 || (!lined && (p.X < r.Left || p.X >= r.Right))) return false;
+                entry = new PointF(lined ? fx * other.Width : p.X - r.Left, 0);
                 return true;
             default:
-                if (p.Y > me.Top + 1 || dy >= 0 || p.X < r.Left || p.X >= r.Right) return false;
-                entry = new PointF(p.X - r.Left, other.Height - 1);
+                if (p.Y > me.Top + 1 || dy >= 0 || (!lined && (p.X < r.Left || p.X >= r.Right))) return false;
+                entry = new PointF(lined ? fx * other.Width : p.X - r.Left, other.Height - 1);
                 return true;
         }
     }
@@ -80,24 +84,27 @@ class Arrangement
     public bool Exit(PointF v, RectangleF me, SizeF other, out Point back)
     {
         RectangleF r = OtherRect(me, other);
+        bool lined = Lined;
+        float alongY = lined ? me.Top + v.Y / other.Height * me.Height : v.Y + r.Top;
+        float alongX = lined ? me.Left + v.X / other.Width * me.Width : v.X + r.Left;
         back = Point.Empty;
         switch (Side)
         {
             case Side.Right:
                 if (v.X >= 0) return false;
-                back = new Point((int)me.Right - 3, Clamp(v.Y + r.Top, me.Top + 3, me.Bottom - 3));
+                back = new Point((int)me.Right - 3, Clamp(alongY, me.Top + 3, me.Bottom - 3));
                 return true;
             case Side.Left:
                 if (v.X <= other.Width - 1) return false;
-                back = new Point((int)me.Left + 3, Clamp(v.Y + r.Top, me.Top + 3, me.Bottom - 3));
+                back = new Point((int)me.Left + 3, Clamp(alongY, me.Top + 3, me.Bottom - 3));
                 return true;
             case Side.Below:
                 if (v.Y >= 0) return false;
-                back = new Point(Clamp(v.X + r.Left, me.Left + 3, me.Right - 3), (int)me.Bottom - 3);
+                back = new Point(Clamp(alongX, me.Left + 3, me.Right - 3), (int)me.Bottom - 3);
                 return true;
             default:
                 if (v.Y <= other.Height - 1) return false;
-                back = new Point(Clamp(v.X + r.Left, me.Left + 3, me.Right - 3), (int)me.Top + 3);
+                back = new Point(Clamp(alongX, me.Left + 3, me.Right - 3), (int)me.Top + 3);
                 return true;
         }
     }

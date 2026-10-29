@@ -36,10 +36,11 @@ class Settings
                 else if (name == "arrangement")
                 {
                     string[] f = value.Split('|');
-                    if (f.Length != 3) continue;
+                    if (f.Length < 3) continue;
                     Arrangement a = new Arrangement();
                     a.Side = (Side)Enum.Parse(typeof(Side), f[1]);
                     a.Offset = double.Parse(f[2], CultureInfo.InvariantCulture);
+                    a.Lined = f.Length < 4 || f[3] == "1";
                     arrangements[f[0]] = a;
                 }
             }
@@ -56,7 +57,7 @@ class Settings
             if (LastPeer != null) lines.Add("last=" + LastPeer);
             if (ManualHost != null) lines.Add("host=" + ManualHost);
             foreach (KeyValuePair<string, Arrangement> pair in arrangements)
-                lines.Add("arrangement=" + pair.Key + "|" + pair.Value.Side + "|" + pair.Value.Offset.ToString(CultureInfo.InvariantCulture));
+                lines.Add("arrangement=" + pair.Key + "|" + pair.Value.Side + "|" + pair.Value.Offset.ToString(CultureInfo.InvariantCulture) + "|" + (pair.Value.Lined ? "1" : "0"));
             File.WriteAllLines(file, lines.ToArray());
         }
         catch { }
