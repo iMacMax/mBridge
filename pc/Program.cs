@@ -1,184 +1,122 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-// mBridge for PC: a monitor icon in the system tray. A Mac running mBridge finds this PC on the
-// network and uses its keyboard and mouse to control it. Built with the C# compiler that ships with Windows.
+// mBridge for PC: a monitor icon in the system tray. Use this PC's keyboard and mouse on a Mac or another PC
+// on the same network, and the other way round. Built with the C# compiler that ships with Windows.
 
-static class Native
+/// Remembers where each computer sits, and which one to connect to by itself.
+class Settings
 {
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
-    [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
-    [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
-    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
-    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
-    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
-    [DllImport("user32.dll")] public static extern IntPtr CreateCursor(IntPtr inst, int xHot, int yHot, int w, int h, byte[] andMask, byte[] xorMask);
-    [DllImport("user32.dll")] public static extern bool SetSystemCursor(IntPtr cursor, uint id);
-    [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint action, uint param, IntPtr pv, uint winIni);
-}
+    readonly string file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mBridge", "settings.txt");
+    readonly Dictionary<string, Arrangement> arrangements = new Dictionary<string, Arrangement>();
+    public string LastPeer, ManualHost;
 
-[StructLayout(LayoutKind.Sequential)]
-struct POINT { public int X, Y; }
-
-/// Hides the mouse cursor everywhere by swapping every system cursor for a see-through one,
-/// and puts the real ones back with Show(). Windows has no simpler way to hide it system-wide.
-static class CursorHider
-{
-    static readonly uint[] ids = { 32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650, 32651 };
-    static readonly object gate = new object();
-    static bool hidden;
-    public static int LastX, LastY;   // where the Mac last put the cursor
-
-    public static bool IsHidden { get { lock (gate) { return hidden; } } }
-
-    public static void Hide()
+    public Settings()
     {
-        lock (gate)
+        try
         {
-            if (hidden) return;
-            hidden = true;
-            POINT here;
-            if (Native.GetCursorPos(out here)) { LastX = here.X; LastY = here.Y; }   // movement from now on is the PC's own mouse
-            byte[] andMask = new byte[128], xorMask = new byte[128];
-            for (int i = 0; i < andMask.Length; i++) andMask[i] = 0xFF;
-            foreach (uint id in ids) Native.SetSystemCursor(Native.CreateCursor(IntPtr.Zero, 0, 0, 32, 32, andMask, xorMask), id);
+            foreach (string line in File.ReadAllLines(file))
+            {
+                int eq = line.IndexOf('=');
+                if (eq < 0) continue;
+                string name = line.Substring(0, eq), value = line.Substring(eq + 1);
+                if (name == "last") LastPeer = value;
+                else if (name == "host") ManualHost = value;
+                else if (name == "arrangement")
+                {
+                    string[] f = value.Split('|');
+                    if (f.Length != 3) continue;
+                    Arrangement a = new Arrangement();
+                    a.Side = (Side)Enum.Parse(typeof(Side), f[1]);
+                    a.Offset = double.Parse(f[2], CultureInfo.InvariantCulture);
+                    arrangements[f[0]] = a;
+                }
+            }
         }
+        catch { }
     }
 
-    public static void Show()
+    public void Save()
     {
-        lock (gate)
+        try
         {
-            hidden = false;
-            Native.SystemParametersInfo(0x57, 0, IntPtr.Zero, 0);   // SPI_SETCURSORS: reload the user's cursors
+            Directory.CreateDirectory(Path.GetDirectoryName(file));
+            List<string> lines = new List<string>();
+            if (LastPeer != null) lines.Add("last=" + LastPeer);
+            if (ManualHost != null) lines.Add("host=" + ManualHost);
+            foreach (KeyValuePair<string, Arrangement> pair in arrangements)
+                lines.Add("arrangement=" + pair.Key + "|" + pair.Value.Side + "|" + pair.Value.Offset.ToString(CultureInfo.InvariantCulture));
+            File.WriteAllLines(file, lines.ToArray());
         }
+        catch { }
     }
 
-    /// True when the PC's own mouse moved the cursor since the Mac last placed it.
-    public static bool MovedByUser()
+    /// The layout for a computer; the first time, it sits to the right with the screens centered on each other.
+    public Arrangement Get(Peer peer)
     {
-        POINT p;
-        if (!Native.GetCursorPos(out p)) return false;
-        return Math.Abs(p.X - LastX) > 3 || Math.Abs(p.Y - LastY) > 3;
-    }
-}
-
-class Input
-{
-    const uint LeftDown = 0x2, LeftUp = 0x4, RightDown = 0x8, RightUp = 0x10, MiddleDown = 0x20, MiddleUp = 0x40;
-    const uint XDown = 0x80, XUp = 0x100, Wheel = 0x800, HWheel = 0x1000, KeyUp = 0x2, Extended = 0x1;
-
-    readonly System.Collections.Generic.HashSet<int> keys = new System.Collections.Generic.HashSet<int>();
-    readonly System.Collections.Generic.HashSet<int> buttons = new System.Collections.Generic.HashSet<int>();
-
-    public static int Width { get { return Native.GetSystemMetrics(0); } }
-    public static int Height { get { return Native.GetSystemMetrics(1); } }
-
-    public void Apply(string line)
-    {
-        string[] f = line.Split(' ');
-        switch (f[0])
+        if (peer == null) return new Arrangement();
+        Arrangement a;
+        if (!arrangements.TryGetValue(peer.Id, out a))
         {
-            case "p": MoveCursor(Int(f[1]), Int(f[2])); break;
-            case "b": Button(Int(f[1]), Int(f[2]) == 1); break;
-            case "w": Scroll(Int(f[1]), Int(f[2])); break;
-            case "k": Key(Int(f[1]), Int(f[2]) == 1, Int(f[3]) == 1); break;
-            case "r": ReleaseAll(); break;
+            a = Arrangement.Centered(Side.Right, Controller.Screen.Size, new SizeF(peer.Width, peer.Height));
+            arrangements[peer.Id] = a;
         }
+        return a;
     }
 
-    static void MoveCursor(int x, int y)
-    {
-        CursorHider.LastX = x;
-        CursorHider.LastY = y;
-        Native.SetCursorPos(x, y);
-    }
-
-    static int Int(string s) { return int.Parse(s, CultureInfo.InvariantCulture); }
-
-    void Button(int number, bool down)
-    {
-        if (down) buttons.Add(number); else buttons.Remove(number);
-        switch (number)
-        {
-            case 0: Native.mouse_event(down ? LeftDown : LeftUp, 0, 0, 0, UIntPtr.Zero); break;
-            case 1: Native.mouse_event(down ? RightDown : RightUp, 0, 0, 0, UIntPtr.Zero); break;
-            case 2: Native.mouse_event(down ? MiddleDown : MiddleUp, 0, 0, 0, UIntPtr.Zero); break;
-            case 3: Native.mouse_event(down ? XDown : XUp, 0, 0, 1, UIntPtr.Zero); break;   // back
-            case 4: Native.mouse_event(down ? XDown : XUp, 0, 0, 2, UIntPtr.Zero); break;   // forward
-        }
-    }
-
-    // The Mac sends scroll distance in pixels; about 10 pixels is one notch of the wheel.
-    void Scroll(int dx, int dy)
-    {
-        if (dy != 0) Native.mouse_event(Wheel, 0, 0, dy * 12, UIntPtr.Zero);
-        if (dx != 0) Native.mouse_event(HWheel, 0, 0, -dx * 12, UIntPtr.Zero);
-    }
-
-    void Key(int vk, bool extended, bool down)
-    {
-        int id = vk | (extended ? 0x100 : 0);
-        if (down) keys.Add(id); else keys.Remove(id);
-        uint flags = (extended ? Extended : 0) | (down ? 0 : KeyUp);
-        Native.keybd_event((byte)vk, (byte)Native.MapVirtualKey((uint)vk, 0), flags, UIntPtr.Zero);
-    }
-
-    /// Lets go of everything still held, so a key or button never gets stuck when the Mac leaves.
-    public void ReleaseAll()
-    {
-        foreach (int id in new System.Collections.Generic.List<int>(keys)) Key(id & 0xFF, (id & 0x100) != 0, false);
-        foreach (int b in new System.Collections.Generic.List<int>(buttons)) Button(b, false);
-    }
+    public void Set(Peer peer, Arrangement a) { arrangements[peer.Id] = a; Save(); }
 }
 
 class App : ApplicationContext
 {
-    const int BeaconPort = 24801, ListenPort = 24802;
+    public const int BeaconPort = 24801, ListenPort = 24802;
 
     readonly NotifyIcon tray = new NotifyIcon();
-    readonly ToolStripMenuItem status = new ToolStripMenuItem("Waiting for a Mac…");
+    readonly ContextMenuStrip menu = new ContextMenuStrip();
     readonly Control ui = new Control();   // other threads hand work to the window thread through this
-    readonly string keyFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mBridge", "paired.txt");
+    readonly string dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mBridge");
+    readonly string keyFile;
     readonly Input input = new Input();
+    readonly Settings settings = new Settings();
+    readonly Controller controller;
+    readonly Dictionary<string, Peer> peers = new Dictionary<string, Peer>();
+    readonly Icon idleIcon = MonitorIcon(false), activeIcon = MonitorIcon(true);
+    readonly Dictionary<string, Bitmap> platformIcons = new Dictionary<string, Bitmap>();
     readonly object writeLock = new object();
+    readonly string myKey;
+    string statusText = "Looking for a computer…";
+    bool paused;                // the user chose Disconnect: don't reconnect on our own
+
+    // the computer controlling this PC, if any
     TcpClient current;
     NetworkStream currentStream;
+    string controllerName;
     uint clipboardSeq;
+
+    public string Key { get { return myKey; } }
+    public Settings Arrangements { get { return settings; } }
 
     public App()
     {
         IntPtr handle = ui.Handle;             // creates the window on this thread, so BeginInvoke has somewhere to go
-        status.Enabled = false;
-        ToolStripMenuItem login = new ToolStripMenuItem("Open at Login");
-        login.Checked = LoginEnabled();
-        login.Click += delegate { SetLogin(!LoginEnabled()); login.Checked = LoginEnabled(); };
-        ToolStripMenuItem forget = new ToolStripMenuItem("Forget Paired Mac");
-        forget.Click += delegate { try { File.Delete(keyFile); } catch { } SetStatus("Waiting for a Mac…"); };
-        ToolStripMenuItem quit = new ToolStripMenuItem("Quit mBridge");
-        quit.Click += delegate { input.ReleaseAll(); CursorHider.Show(); tray.Visible = false; Application.Exit(); };
+        keyFile = Path.Combine(dataDir, "paired.txt");
+        myKey = LoadOwnKey();
+        controller = new Controller(this);
 
-        ContextMenuStrip menu = new ContextMenuStrip();
-        menu.Items.Add(status);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(login);
-        menu.Items.Add(forget);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(quit);
+        menu.Opening += delegate { BuildMenu(); };
         tray.ContextMenuStrip = menu;
-        tray.Icon = MonitorIcon();
+        tray.Icon = idleIcon;
         tray.Text = "mBridge";
         tray.Visible = true;
 
@@ -191,19 +129,230 @@ class App : ApplicationContext
         CursorHider.Show();   // a crashed run could have left the cursors hidden
         System.Windows.Forms.Timer userMouse = new System.Windows.Forms.Timer();
         userMouse.Interval = 100;
-        userMouse.Tick += delegate { if (CursorHider.IsHidden && CursorHider.MovedByUser()) CursorHider.Show(); };
+        userMouse.Tick += delegate { if (!controller.Remote && CursorHider.IsHidden && CursorHider.MovedByUser()) CursorHider.Show(); };
         userMouse.Start();
         AppDomain.CurrentDomain.ProcessExit += delegate { CursorHider.Show(); };
 
+        System.Windows.Forms.Timer auto = new System.Windows.Forms.Timer();
+        auto.Interval = 2000;
+        auto.Tick += delegate { AutoConnect(); };
+        auto.Start();
+
         Thread listen = new Thread(Listen); listen.IsBackground = true; listen.Start();
         Thread beacon = new Thread(Beacon); beacon.IsBackground = true; beacon.Start();
+        Thread discover = new Thread(Discover); discover.IsBackground = true; discover.Start();
     }
 
-    // MARK: tray
+    // MARK: window thread
 
-    void SetStatus(string text) { ui.BeginInvoke((MethodInvoker)delegate { status.Text = text; }); }
+    public void UiPost(MethodInvoker action) { ui.BeginInvoke(action); }
 
-    static Icon MonitorIcon()
+    public void SetStatus(string text)
+    {
+        statusText = text;
+        UiPost(delegate { tray.Text = text.Length > 63 ? text.Substring(0, 63) : text; });
+    }
+
+    /// The icon is solid while the keyboard and mouse are on the other computer.
+    public void OnControllerChanged()
+    {
+        tray.Icon = controller.Remote ? activeIcon : idleIcon;
+    }
+
+    // MARK: menu
+
+    List<Peer> FreshPeers()
+    {
+        List<Peer> list = new List<Peer>();
+        lock (peers)
+        {
+            foreach (Peer p in peers.Values)
+                if ((DateTime.Now - p.Seen).TotalSeconds < 5) list.Add(p);
+        }
+        list.Sort(delegate(Peer a, Peer b) { return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); });
+        return list;
+    }
+
+    /// Rebuilt every time the menu opens, so it always shows the current state.
+    void BuildMenu()
+    {
+        menu.Items.Clear();
+        ToolStripMenuItem status = new ToolStripMenuItem(statusText);
+        status.Enabled = false;
+        menu.Items.Add(status);
+        menu.Items.Add(new ToolStripSeparator());
+
+        // Computers: click one to control it, click it again to let go.
+        List<Peer> list = FreshPeers();
+        foreach (Peer found in list)
+        {
+            Peer peer = found;
+            ToolStripMenuItem item = new ToolStripMenuItem(peer.Name);
+            item.Image = PlatformIcon(peer.Platform);
+            item.Checked = controller.Connected && controller.Target != null && controller.Target.Id == peer.Id;
+            item.Click += delegate { Choose(peer); };
+            menu.Items.Add(item);
+        }
+        if (list.Count == 0)
+        {
+            ToolStripMenuItem none = new ToolStripMenuItem("No other computers found");
+            none.Enabled = false;
+            menu.Items.Add(none);
+        }
+        ToolStripMenuItem address = new ToolStripMenuItem("Enter Address…");
+        address.Click += delegate { EnterAddress(); };
+        menu.Items.Add(address);
+
+        if (controllerName != null)
+        {
+            menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem stop = new ToolStripMenuItem("Stop Being Controlled by " + controllerName);
+            stop.Click += delegate { DropController(); };
+            menu.Items.Add(stop);
+        }
+
+        if (controller.Connected && controller.Target != null)
+        {
+            menu.Items.Add(new ToolStripSeparator());
+            Peer target = controller.Target;
+            ToolStripMenuItem position = new ToolStripMenuItem("Position   " + target.Name + " is " + settings.Get(target).Side.ToString().ToLower());
+            foreach (Side side in new Side[] { Side.Left, Side.Right, Side.Above, Side.Below })
+            {
+                Side chosen = side;
+                ToolStripMenuItem entry = new ToolStripMenuItem(side.ToString());
+                entry.Checked = settings.Get(target).Side == side;
+                entry.Click += delegate { settings.Set(target, Arrangement.Centered(chosen, Controller.Screen.Size, controller.OtherSize)); };
+                position.DropDownItems.Add(entry);
+            }
+            menu.Items.Add(position);
+
+            ToolStripMenuItem toggle = new ToolStripMenuItem(controller.Remote ? "Back to This PC   Ctrl+Alt+Win+Esc" : "Switch to " + target.Name);
+            toggle.Click += delegate { controller.Toggle(); };
+            menu.Items.Add(toggle);
+        }
+
+        menu.Items.Add(new ToolStripSeparator());
+        ToolStripMenuItem forget = new ToolStripMenuItem("Forget Paired Computer");
+        forget.Click += delegate { try { File.Delete(keyFile); } catch { } };
+        menu.Items.Add(forget);
+        ToolStripMenuItem login = new ToolStripMenuItem("Open at Login");
+        login.Checked = LoginEnabled();
+        login.Click += delegate { SetLogin(!LoginEnabled()); };
+        menu.Items.Add(login);
+        menu.Items.Add(new ToolStripSeparator());
+        ToolStripMenuItem quit = new ToolStripMenuItem("Quit mBridge");
+        quit.Click += delegate { controller.Disconnect(); input.ReleaseAll(); CursorHider.Show(); tray.Visible = false; Application.Exit(); };
+        menu.Items.Add(quit);
+    }
+
+    void Choose(Peer peer)
+    {
+        if (controller.Connected && controller.Target != null && controller.Target.Id == peer.Id)
+        {
+            paused = true;
+            controller.Disconnect();
+            return;
+        }
+        paused = false;
+        settings.LastPeer = peer.Id;
+        settings.Save();
+        if (controller.Connected) controller.Disconnect();
+        DropController();   // one role at a time: stop being controlled while we control
+        controller.Connect(peer);
+    }
+
+    void EnterAddress()
+    {
+        string host = Ask("Computer address", "Only needed if the other computer isn't found by itself. It's its IP address, like 192.168.1.20.", settings.ManualHost ?? "");
+        if (string.IsNullOrEmpty(host)) return;
+        settings.ManualHost = host;
+        settings.Save();
+        Peer peer = new Peer();
+        peer.Id = "manual:" + host;
+        peer.Name = host;
+        peer.Host = host;
+        peer.Port = ListenPort;
+        peer.Width = 1920;
+        peer.Height = 1080;
+        peer.Platform = "win";
+        peer.Seen = DateTime.Now;
+        paused = false;
+        if (controller.Connected) controller.Disconnect();
+        DropController();
+        controller.Connect(peer);
+    }
+
+    static string Ask(string title, string text, string initial)
+    {
+        Form form = new Form();
+        form.Text = title;
+        form.FormBorderStyle = FormBorderStyle.FixedDialog;
+        form.StartPosition = FormStartPosition.CenterScreen;
+        form.MaximizeBox = false;
+        form.MinimizeBox = false;
+        form.TopMost = true;
+        form.ClientSize = new Size(320, 120);
+        Label label = new Label();
+        label.Text = text;
+        label.SetBounds(10, 10, 300, 40);
+        TextBox box = new TextBox();
+        box.Text = initial;
+        box.SetBounds(10, 58, 300, 22);
+        Button ok = new Button();
+        ok.Text = "Connect";
+        ok.DialogResult = DialogResult.OK;
+        ok.SetBounds(150, 88, 75, 24);
+        Button cancel = new Button();
+        cancel.Text = "Cancel";
+        cancel.DialogResult = DialogResult.Cancel;
+        cancel.SetBounds(235, 88, 75, 24);
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+        form.Controls.AddRange(new Control[] { label, box, ok, cancel });
+        return form.ShowDialog() == DialogResult.OK ? box.Text.Trim() : null;
+    }
+
+    /// Reconnects to the computer picked last, once it shows up.
+    void AutoConnect()
+    {
+        if (paused || controller.Connected || controller.Connecting || current != null) return;
+        foreach (Peer p in FreshPeers())
+        {
+            if (p.Id == settings.LastPeer) { controller.Connect(p); return; }
+        }
+    }
+
+    /// The small logo next to a computer: an Apple for a Mac, four panes for Windows.
+    Bitmap PlatformIcon(string platform)
+    {
+        Bitmap bmp;
+        if (platformIcons.TryGetValue(platform, out bmp)) return bmp;
+        bmp = new Bitmap(16, 16);
+        using (Graphics g = Graphics.FromImage(bmp))
+        using (Brush ink = new SolidBrush(Color.FromArgb(70, 70, 70)))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            if (platform == "mac")
+            {
+                g.FillEllipse(ink, 2, 5, 7, 10);
+                g.FillEllipse(ink, 7, 5, 7, 10);
+                g.FillEllipse(ink, 8, 0, 5, 3);                       // the leaf
+                g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                g.FillEllipse(Brushes.Transparent, 11, 6, 6, 6);      // the bite
+            }
+            else
+            {
+                g.FillRectangle(ink, 1, 2, 6, 6);
+                g.FillRectangle(ink, 9, 1, 6, 7);
+                g.FillRectangle(ink, 1, 9, 6, 6);
+                g.FillRectangle(ink, 9, 9, 6, 6);
+            }
+        }
+        platformIcons[platform] = bmp;
+        return bmp;
+    }
+
+    static Icon MonitorIcon(bool active)
     {
         bool light = true;
         try { light = (int)Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "SystemUsesLightTheme", 1) == 1; } catch { }
@@ -214,7 +363,7 @@ class App : ApplicationContext
         using (Brush brush = new SolidBrush(ink))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            g.DrawRectangle(pen, 3, 5, 25, 17);
+            if (active) g.FillRectangle(brush, 3, 5, 25, 17); else g.DrawRectangle(pen, 3, 5, 25, 17);
             g.FillRectangle(brush, 14, 22, 4, 4);
             g.FillRectangle(brush, 9, 26, 14, 3);
         }
@@ -237,7 +386,7 @@ class App : ApplicationContext
     }
 
     /// Problems go to %LOCALAPPDATA%\mBridge\log.txt, so they can be looked at later.
-    static void Log(string message)
+    public static void Log(string message)
     {
         try
         {
@@ -248,41 +397,56 @@ class App : ApplicationContext
         catch { }
     }
 
+    /// This PC's own secret, shown to computers it controls so they can remember it.
+    string LoadOwnKey()
+    {
+        string path = Path.Combine(dataDir, "mykey.txt");
+        try { string saved = File.ReadAllText(path).Trim(); if (saved.Length > 0) return saved; } catch { }
+        byte[] bytes = new byte[16];
+        using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) { rng.GetBytes(bytes); }
+        StringBuilder hex = new StringBuilder();
+        foreach (byte b in bytes) hex.Append(b.ToString("x2"));
+        try { Directory.CreateDirectory(dataDir); File.WriteAllText(path, hex.ToString()); } catch { }
+        return hex.ToString();
+    }
+
     // MARK: clipboard
 
-    /// Text copied here is sent to the Mac. Copies marked as secret (password managers) are never sent.
+    /// Text copied here is sent to the other computer, whichever way you are connected.
+    /// Copies marked as secret (password managers) are never sent.
     void WatchClipboard()
     {
         uint seq = Native.GetClipboardSequenceNumber();
         if (seq == clipboardSeq) return;
         clipboardSeq = seq;
         NetworkStream stream = currentStream;
-        if (stream == null) return;
+        if (stream == null && !controller.Connected) return;
         try
         {
             if (!Clipboard.ContainsText() || Clipboard.ContainsData("ExcludeClipboardContentFromMonitorProcessing")) return;
             string text = Clipboard.GetText();
             if (text.Length == 0 || text.Length > 256000) return;
-            Send(stream, "c " + Convert.ToBase64String(Encoding.UTF8.GetBytes(text.Replace("\r\n", "\n"))));
-            Log("clipboard sent to Mac: " + text.Length + " characters");
+            string line = "c " + Convert.ToBase64String(Encoding.UTF8.GetBytes(text.Replace("\r\n", "\n")));
+            controller.Send(line);
+            if (stream != null) Send(stream, line);
+            Log("clipboard sent: " + text.Length + " characters");
         }
         catch (Exception e) { Log("clipboard send: " + e.Message); }
     }
 
-    /// Text copied on the Mac arrives as "c <base64>".
-    void SetClipboard(string base64)
+    /// Text copied on the other computer arrives as "c <base64>".
+    public void SetClipboard(string base64)
     {
         string text;
-        try { text = Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch (Exception e) { Log("clipboard from Mac unreadable: " + e.Message); return; }
-        Log("clipboard from Mac: " + text.Length + " characters");
+        try { text = Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch (Exception e) { Log("clipboard unreadable: " + e.Message); return; }
+        Log("clipboard received: " + text.Length + " characters");
         if (text.Length == 0) return;
-        ui.BeginInvoke((MethodInvoker)delegate
+        UiPost(delegate
         {
             try
             {
                 Clipboard.SetDataObject(text.Replace("\r\n", "\n").Replace("\n", "\r\n"), true, 10, 100);
                 clipboardSeq = Native.GetClipboardSequenceNumber();
-                Log("clipboard set");
             }
             catch (Exception e) { Log("clipboard: " + e.Message); }
         });
@@ -290,7 +454,7 @@ class App : ApplicationContext
 
     // MARK: network
 
-    /// Shouts "I'm here" once a second so the Mac can find this PC without any setup.
+    /// Shouts "I'm here" once a second so other computers can find this PC without any setup.
     void Beacon()
     {
         UdpClient udp = new UdpClient();
@@ -299,7 +463,8 @@ class App : ApplicationContext
         {
             try
             {
-                string text = "mBridge|" + Environment.MachineName + "|" + Environment.MachineName + "|" + Input.Width + "|" + Input.Height + "|" + ListenPort;
+                string name = Environment.MachineName.Replace("|", "/");
+                string text = "mBridge|" + Environment.MachineName + "|" + name + "|" + Input.Width + "|" + Input.Height + "|" + ListenPort + "|win";
                 byte[] data = Encoding.UTF8.GetBytes(text);
                 udp.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, BeaconPort));
                 foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
@@ -316,6 +481,40 @@ class App : ApplicationContext
             }
             catch { }
             Thread.Sleep(1000);
+        }
+    }
+
+    /// Listens for other computers' "I'm here": "mBridge|id|name|width|height|port|platform".
+    void Discover()
+    {
+        UdpClient udp;
+        try
+        {
+            udp = new UdpClient();
+            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            udp.Client.Bind(new IPEndPoint(IPAddress.Any, BeaconPort));
+        }
+        catch (Exception e) { Log("discovery: " + e.Message); return; }
+
+        while (true)
+        {
+            try
+            {
+                IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                string[] f = Encoding.UTF8.GetString(udp.Receive(ref from)).Split('|');
+                if (f.Length < 6 || f[0] != "mBridge" || f[1] == Environment.MachineName) continue;
+                Peer p = new Peer();
+                p.Id = f[1];
+                p.Name = f[2];
+                p.Host = from.Address.ToString();
+                p.Width = int.Parse(f[3], CultureInfo.InvariantCulture);
+                p.Height = int.Parse(f[4], CultureInfo.InvariantCulture);
+                p.Port = int.Parse(f[5], CultureInfo.InvariantCulture);
+                p.Platform = f.Length > 6 ? f[6].Trim() : "win";
+                p.Seen = DateTime.Now;
+                lock (peers) { peers[p.Id] = p; }
+            }
+            catch (Exception) { Thread.Sleep(200); }
         }
     }
 
@@ -340,20 +539,28 @@ class App : ApplicationContext
         lock (writeLock) { stream.Write(bytes, 0, bytes.Length); }
     }
 
+    /// Lets go of the computer that is controlling this PC.
+    void DropController()
+    {
+        TcpClient c = current;
+        if (c != null) { try { c.Close(); } catch { } }
+    }
+
+    /// Another computer controls this PC: its keyboard and mouse arrive here as lines.
     void Serve(TcpClient client)
     {
         System.Threading.Timer heartbeat = null;
         try
         {
             client.NoDelay = true;
-            client.ReceiveTimeout = 5000;   // the Mac sends "." every second
+            client.ReceiveTimeout = 5000;   // the controlling computer sends "." every second
             NetworkStream stream = client.GetStream();
             StreamReader reader = new StreamReader(stream, Encoding.UTF8);
 
             string[] hello = (reader.ReadLine() ?? "").Split(new char[] { ' ' }, 3);
             if (hello.Length < 3 || hello[0] != "hi") return;
 
-            // The first Mac to connect is remembered; any other Mac is turned away until "Forget Paired Mac".
+            // The first computer to connect is remembered; any other is turned away until "Forget Paired Computer".
             string saved = null;
             try { saved = File.ReadAllText(keyFile).Trim(); } catch { }
             if (saved == null || saved.Length == 0)
@@ -368,13 +575,16 @@ class App : ApplicationContext
                 return;
             }
 
+            // one role at a time: stop controlling while we are controlled
+            UiPost(delegate { paused = true; controller.Disconnect(); });
             TcpClient previous = current;
             current = client;
             currentStream = stream;
+            controllerName = hello[2];
             if (previous != null) { try { previous.Close(); } catch { } }
 
-            Send(stream, "ok " + Input.Width + " " + Input.Height);
-            SetStatus("Connected to " + hello[2]);
+            Send(stream, "ok " + Input.Width + " " + Input.Height + " win");
+            SetStatus("Controlled by " + hello[2]);
             heartbeat = new System.Threading.Timer(delegate { try { Send(stream, "."); } catch { } }, null, 1000, 1000);
 
             string line;
@@ -392,8 +602,14 @@ class App : ApplicationContext
         {
             if (heartbeat != null) heartbeat.Dispose();
             input.ReleaseAll();
-            if (current == client) CursorHider.Show();
-            if (current == client) { current = null; currentStream = null; SetStatus("Waiting for a Mac…"); }
+            if (current == client)
+            {
+                CursorHider.Show();
+                current = null;
+                currentStream = null;
+                controllerName = null;
+                SetStatus("Looking for a computer…");
+            }
             try { client.Close(); } catch { }
         }
     }
@@ -408,7 +624,7 @@ static class Program
         using (Mutex one = new Mutex(true, "mBridgePC", out first))
         {
             if (!first) return;
-            Native.SetProcessDPIAware();   // real pixels, so the cursor lands where the Mac says
+            Native.SetProcessDPIAware();   // real pixels, so the cursor lands where the other computer says
             Application.EnableVisualStyles();
             Application.Run(new App());
         }

@@ -47,3 +47,20 @@ let winModifiers: [Int: (key: WinKey, flag: CGEventFlags)] = [
 ]
 let capsLockKeyCode = 57
 let capsLockKey = WinKey(0x14)
+
+// The other way round, for when another computer controls this Mac: Windows key code -> Mac key code.
+// Ctrl from the other side acts as Command, the Windows key as Control, Alt as Option (the same swap in reverse).
+
+let macKeys: [Int: Int] = {
+    var table = [Int: Int]()
+    for (code, key) in winKeys { table[key.vk | (key.extended ? 0x100 : 0)] = code }
+    return table
+}()
+
+/// Windows modifier key code -> (Mac modifier key code, the flag it sets).
+let macModifiers: [Int: (code: Int, flag: CGEventFlags)] = [
+    0xA0: (56, .maskShift), 0xA1: (60, .maskShift),
+    0xA2: (55, .maskCommand), 0xA3: (54, .maskCommand),
+    0x5B: (59, .maskControl), 0x5C: (62, .maskControl),
+    0xA4: (58, .maskAlternate), 0xA5: (61, .maskAlternate),
+]

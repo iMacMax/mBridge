@@ -1,8 +1,8 @@
 import Cocoa
 import ServiceManagement
 
-// mBridge: a monitor icon in your menu bar. Use this Mac's keyboard and mouse on a PC on the same network.
-// Push the cursor off the edge of the screen where the PC sits and it carries on over there.
+// mBridge: a monitor icon in your menu bar. Use this Mac's keyboard and mouse on another Mac or a PC on the same
+// network, and the other way round. Push the cursor off the edge of the screen where the other computer sits.
 //
 // Permissions (System Settings > Privacy & Security): Input Monitoring to see the keys and mouse,
 // Accessibility to take them over while you are on the PC.
@@ -49,10 +49,31 @@ func installTap() -> Bool {
 
 // MARK: - Menu
 
-/// Remembers which PC a menu item belongs to.
+/// Remembers which computer a menu item belongs to.
 final class Ref: NSObject {
     let peer: Peer
     init(_ peer: Peer) { self.peer = peer }
+}
+
+/// The small logo shown next to a computer: an Apple for a Mac, four panes for Windows.
+func platformIcon(_ platform: String) -> NSImage {
+    if platform == "mac", let apple = NSImage(systemSymbolName: "applelogo", accessibilityDescription: "Mac") {
+        apple.isTemplate = true
+        return apple
+    }
+    let size = NSSize(width: 14, height: 14)
+    let image = NSImage(size: size, flipped: false) { _ in
+        NSColor.black.setFill()
+        let gap: CGFloat = 1.5, pane = (size.width - gap) / 2
+        for column in 0..<2 {
+            for row in 0..<2 {
+                NSBezierPath(rect: NSRect(x: CGFloat(column) * (pane + gap), y: CGFloat(row) * (pane + gap), width: pane, height: pane)).fill()
+            }
+        }
+        return true
+    }
+    image.isTemplate = true
+    return image
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -90,9 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) { bridge.shutDown() }
 
-    /// The icon is dim until a PC is connected, and solid while the keyboard and mouse are on the PC.
+    /// The icon is dim until a computer is connected, and shows an arrow while the keyboard and mouse are on the other one.
     private func refreshIcon() {
-        statusItem.button?.appearsDisabled = !bridge.isConnected
+        statusItem.button?.appearsDisabled = !(bridge.isConnected || bridge.isControlled)
         let name = bridge.mode == .pc ? "display.and.arrow.down" : "display"
         let icon = NSImage(systemSymbolName: name, accessibilityDescription: "mBridge") ?? NSImage(systemSymbolName: "display", accessibilityDescription: "mBridge")
         icon?.isTemplate = true
@@ -124,41 +145,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(status)
         menu.addItem(.separator())
 
-        // PC
-        let pcMenu = NSMenu(title: "PC")
+        // Computers: click one to control it, click it again to let go.
         for peer in bridge.peers.values.sorted(by: { $0.name < $1.name }) {
             let entry = item(peer.name, #selector(choose(_:)), Ref(peer))
-            entry.state = bridge.isConnected && bridge.connectedName == peer.name ? .on : .off
-            pcMenu.addItem(entry)
+            entry.image = platformIcon(peer.platform)
+            entry.state = bridge.isConnected && bridge.connectedID == peer.id ? .on : .off
+            menu.addItem(entry)
         }
-        if bridge.peers.isEmpty { pcMenu.addItem(NSMenuItem(title: "No PC found", action: nil, keyEquivalent: "")) }
-        pcMenu.addItem(.separator())
-        pcMenu.addItem(item("Enter Address…", #selector(enterAddress)))
-        if bridge.isConnected || (!bridge.isPaused && bridge.manualHost != nil) {
-            pcMenu.addItem(item("Disconnect", #selector(pause)))
-        } else if bridge.isPaused {
-            pcMenu.addItem(item("Connect", #selector(resume)))
+        if bridge.peers.isEmpty {
+            let none = NSMenuItem(title: "No other computers found", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
         }
-        menu.addItem(row("PC", bridge.connectedName ?? "none", pcMenu))
+        menu.addItem(item("Enter Address…", #selector(enterAddress)))
+
+        if let controller = bridge.controllerName {
+            menu.addItem(.separator())
+            menu.addItem(item("Stop Being Controlled by \(controller)", #selector(releaseController)))
+        }
 
         // Position
-        let positionMenu = NSMenu(title: "Position")
-        for side in Side.allCases {
-            let entry = item(side.title, #selector(setSide(_:)))
-            entry.representedObject = side.rawValue
-            entry.state = bridge.arrangement.side == side ? .on : .off
-            positionMenu.addItem(entry)
+        if bridge.isConnected {
+            menu.addItem(.separator())
+            let positionMenu = NSMenu(title: "Position")
+            for side in Side.allCases {
+                let entry = item(side.title, #selector(setSide(_:)))
+                entry.representedObject = side.rawValue
+                entry.state = bridge.arrangement.side == side ? .on : .off
+                positionMenu.addItem(entry)
+            }
+            positionMenu.addItem(.separator())
+            positionMenu.addItem(item("Arrange…", #selector(openArrange)))
+            menu.addItem(row("Position", "\(bridge.connectedName ?? "It") is \(bridge.arrangement.side.title.lowercased())", positionMenu))
+
+            let other = bridge.connectedName ?? "Computer"
+            menu.addItem(item(bridge.mode == .pc ? "Back to This Mac   ⌃⌥⌘⎋" : "Switch to \(other)", #selector(toggle)))
         }
-        positionMenu.addItem(.separator())
-        positionMenu.addItem(item("Arrange…", #selector(openArrange)))
-        menu.addItem(row("Position", "PC is \(bridge.arrangement.side.title.lowercased())", positionMenu))
 
         menu.addItem(.separator())
-        let switchItem = item(bridge.mode == .pc ? "Back to Mac   ⌃⌥⌘⎋" : "Switch to PC", #selector(toggle))
-        switchItem.isEnabled = bridge.isConnected
-        menu.addItem(switchItem)
-
-        menu.addItem(.separator())
+        menu.addItem(item("Forget Paired Computer", #selector(forgetPaired)))
         let login = item("Open at Login", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -174,8 +199,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func choose(_ sender: NSMenuItem) {
-        if let ref = sender.representedObject as? Ref { bridge.choose(ref.peer) }
+        guard let ref = sender.representedObject as? Ref else { return }
+        if bridge.isConnected && bridge.connectedID == ref.peer.id { bridge.pause() } else { bridge.choose(ref.peer) }
     }
+
+    @objc func releaseController() { bridge.releaseController() }
+    @objc func forgetPaired() { Pairing.forget() }
 
     @objc func setSide(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let side = Side(rawValue: raw) else { return }
@@ -183,13 +212,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openArrange() {
-        arrange.show(bridge: bridge, pcName: bridge.connectedName ?? bridge.peers.values.first?.name ?? "PC")
+        arrange.show(bridge: bridge, pcName: bridge.connectedName ?? bridge.peers.values.first?.name ?? "Computer")
     }
 
     @objc func enterAddress() {
         let alert = NSAlert()
-        alert.messageText = "PC address"
-        alert.informativeText = "Only needed if the PC isn't found by itself. It's the PC's IP address, like 192.168.1.20."
+        alert.messageText = "Computer address"
+        alert.informativeText = "Only needed if the other computer isn't found by itself. It's the other computer's IP address, like 192.168.1.20."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
         field.stringValue = bridge.manualHost ?? ""
         alert.accessoryView = field
@@ -202,8 +231,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !host.isEmpty { bridge.connectManually(host) }
     }
 
-    @objc func pause() { bridge.pause() }
-    @objc func resume() { bridge.resume() }
     @objc func toggle() { bridge.toggleFromMenu() }
 
     @objc func openSettings() {

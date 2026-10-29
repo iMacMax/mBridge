@@ -1,7 +1,8 @@
 import Cocoa
 
-// The core: finds the PC, keeps the connection, and decides whether the keyboard and mouse
-// drive the Mac or the PC. Push the cursor against the edge where the PC sits to cross over.
+// The core: finds other computers, keeps the connection, and decides whether the keyboard and mouse
+// drive this Mac or the computer you are controlling. Push the cursor against the edge where the other
+// computer sits to cross over. Any computer can also be controlled by another one (see Receiver).
 
 @_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSSetConnectionProperty")
@@ -14,67 +15,101 @@ private func mouseDelta(_ event: CGEvent) -> CGPoint {
 }
 
 final class Bridge {
-    static let macName = Host.current().localizedName ?? "Mac"
+    static let macName = (Host.current().localizedName ?? "Mac").replacingOccurrences(of: "|", with: "/")
     static let defaultPCSize = CGSize(width: 1920, height: 1080)
 
+    let selfID: String
     private(set) var peers: [String: Peer] = [:]
     private(set) var mode: Mode = .mac
     private(set) var connectedName: String?
-    private(set) var status = "Looking for a PC…"
+    private(set) var connectedID: String?
+    private(set) var connectedPlatform = "win"
+    private(set) var controllerName: String?   // the computer that is controlling this Mac, if any
+    private(set) var status = "Looking for a computer…"
     var isConnected: Bool { link != nil }
+    var isControlled: Bool { incoming != nil }
     var onChange: (() -> Void)?
 
-    /// The PC's screen size, remembered so the layout can be arranged before the PC is found.
-    private(set) var pcSize: CGSize
+    /// The layout and screen size are remembered for each computer, so they can be arranged before it is found.
+    private var arrangements: [String: Arrangement] = [:]
+    private var sizes: [String: CGSize] = [:]
+    private var targetKey: String { connectedID ?? lastPeerID ?? "default" }
+
     var arrangement: Arrangement {
-        didSet {
-            if let data = try? JSONEncoder().encode(arrangement) { defaults.set(data, forKey: "arrangement") }
+        get { arrangements[targetKey] ?? arrangements["default"] ?? .standard }
+        set {
+            arrangements[targetKey] = newValue
+            if let data = try? JSONEncoder().encode(arrangements) { defaults.set(data, forKey: "arrangements") }
         }
     }
 
+    /// The other computer's screen size.
+    var pcSize: CGSize { sizes[targetKey] ?? sizes["default"] ?? Bridge.defaultPCSize }
+
     private let defaults = UserDefaults.standard
     private let discovery = Discovery()
-    private var link: Link?
+    private let beacon = Beacon()
+    private let server = Server()
+    let receiver = Receiver()
+    private var link: Link?                 // the computer we are controlling
+    private var incoming: Link?             // the computer controlling us
     private var connecting = false
     private var paused = false              // the user chose Disconnect: don't reconnect on our own
     private var lastAttempt = Date.distantPast
     private var lastPeerID: String?
     private(set) var manualHost: String?
 
-    private var pcPos = CGPoint.zero        // where the cursor is on the PC (PC pixels)
-    private var returnPoint = CGPoint.zero  // where the cursor goes on the Mac if the connection ends
+    private var pcPos = CGPoint.zero        // where the cursor is on the other computer (its pixels)
+    private var returnPoint = CGPoint.zero  // where the cursor goes on this Mac if the connection ends
     private var lastSwitch = Date.distantPast
     private var cursorHidden = false
     private var moveQueued = false
     private var pasteboardCount = NSPasteboard.general.changeCount
     private var ignoreMovesUntil = Date.distantPast   // moving the Mac cursor ourselves reports a fake jump
 
-    /// Shared secret: the PC remembers the first Mac that shows it and refuses every other one.
+    /// Shared secret: the other computer remembers the first one that shows it and refuses every other one.
     private let key: String
 
     init() {
-        if let data = defaults.data(forKey: "arrangement"), let saved = try? JSONDecoder().decode(Arrangement.self, from: data) {
-            arrangement = saved
-        } else {
-            arrangement = .standard
+        if let data = defaults.data(forKey: "arrangements"),
+           let saved = try? JSONDecoder().decode([String: Arrangement].self, from: data) {
+            arrangements = saved
+        } else if let data = defaults.data(forKey: "arrangement"), let old = try? JSONDecoder().decode(Arrangement.self, from: data) {
+            arrangements["default"] = old   // from before there was more than one computer
         }
         let w = defaults.double(forKey: "pcWidth"), h = defaults.double(forKey: "pcHeight")
-        pcSize = w > 0 && h > 0 ? CGSize(width: w, height: h) : Bridge.defaultPCSize
+        if w > 0, h > 0 { sizes["default"] = CGSize(width: w, height: h) }
+        if let data = defaults.data(forKey: "sizes"), let saved = try? JSONDecoder().decode([String: CGSize].self, from: data) {
+            sizes.merge(saved) { _, new in new }
+        }
         lastPeerID = defaults.string(forKey: "lastPeer")
         manualHost = defaults.string(forKey: "manualHost")
+        if let saved = defaults.string(forKey: "selfID") {
+            selfID = saved
+        } else {
+            selfID = "mac-" + (0..<4).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+            defaults.set(selfID, forKey: "selfID")
+        }
         if let saved = defaults.string(forKey: "pairKey") {
             key = saved
         } else {
             key = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
             defaults.set(key, forKey: "pairKey")
         }
+        receiver.setCursorHidden = { [weak self] in self?.setCursorHidden($0) }
     }
 
     func start() {
         CGAssociateMouseAndMouseCursorPosition(1)   // in case an earlier run left the cursor frozen
-        discovery.start { [weak self] peer in self?.found(peer) }
+        discovery.start(selfID: selfID) { [weak self] peer in self?.found(peer) }
+        beacon.start { [selfID] in
+            let screen = macBounds().size
+            return "mBridge|\(selfID)|\(Bridge.macName)|\(Int(screen.width))|\(Int(screen.height))|\(Server.port)|mac"
+        }
+        server.start(size: { macBounds().size }) { [weak self] name, newLink in self?.accepted(name, newLink) }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.watchClipboard() }
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.receiver.showCursorIfUserMovedMouse() }
         tick()
     }
 
@@ -82,38 +117,40 @@ final class Bridge {
 
     private func found(_ peer: Peer) {
         peers[peer.id] = peer
-        if peer.id == lastPeerID || lastPeerID == nil { learnSize(peer.size) }
+        learnSize(peer.size, for: peer.id)
         autoConnect()
         onChange?()
     }
 
     private func tick() {
         link?.send(".")
+        incoming?.send(".")
         if mode == .pc, link == nil { leavePC(to: returnPoint) }
         let before = peers.count
         peers = peers.filter { Date().timeIntervalSince($0.value.seen) < 5 }
-        if link == nil, !connecting {
+        if link == nil, incoming == nil, !connecting {
             autoConnect()
-            if peers.isEmpty { status = manualHost.map { "Trying \($0)…" } ?? "Looking for a PC…" }
+            if peers.isEmpty { status = manualHost.map { "Trying \($0)…" } ?? "Looking for a computer…" }
         }
         if peers.count != before { onChange?() }
     }
 
     private func autoConnect() {
-        guard link == nil, !connecting, !paused, Date().timeIntervalSince(lastAttempt) > 3 else { return }
-        if let peer = peers[lastPeerID ?? ""] ?? (lastPeerID == nil ? peers.values.first : nil) {
+        guard link == nil, incoming == nil, !connecting, !paused, Date().timeIntervalSince(lastAttempt) > 3 else { return }
+        if let peer = peers[lastPeerID ?? ""] ?? (lastPeerID == nil && peers.count == 1 ? peers.values.first : nil) {
             connect(host: peer.host, port: peer.port, id: peer.id)
         } else if peers.isEmpty, let host = manualHost {
-            connect(host: host, port: 24802, id: nil)
+            connect(host: host, port: Server.port, id: nil)
         }
     }
 
-    /// The user picked a PC from the menu.
+    /// The user picked a computer from the menu: take control of it.
     func choose(_ peer: Peer) {
         lastPeerID = peer.id
         defaults.set(peer.id, forKey: "lastPeer")
         paused = false
         disconnect()
+        incoming?.hangUp()   // one role at a time: stop being controlled while we control
         connect(host: peer.host, port: peer.port, id: peer.id)
     }
 
@@ -122,7 +159,8 @@ final class Bridge {
         defaults.set(host, forKey: "manualHost")
         paused = false
         disconnect()
-        connect(host: host, port: 24802, id: nil)
+        incoming?.hangUp()
+        connect(host: host, port: Server.port, id: nil)
     }
 
     func pause() {
@@ -132,22 +170,18 @@ final class Bridge {
         onChange?()
     }
 
-    func resume() {
-        paused = false
-        lastAttempt = .distantPast
-        autoConnect()
-        onChange?()
-    }
-
     var isPaused: Bool { paused }
+
+    /// Lets the computer that is controlling this Mac go.
+    func releaseController() { incoming?.hangUp() }
 
     private func connect(host: String, port: UInt16, id: String?) {
         guard !connecting, link == nil else { return }
         connecting = true
         lastAttempt = Date()
-        status = "Connecting to \(host)…"
+        status = "Connecting to \(peers[id ?? ""]?.name ?? host)…"
         onChange?()
-        let hello = "hi \(key) \(Bridge.macName)"
+        let hello = "hi \(key) \(Bridge.macName)\nplat mac"
         DispatchQueue.global().async {
             let result = Link.open(host: host, port: port, hello: hello)
             DispatchQueue.main.async { self.opened(result, id: id, host: host) }
@@ -160,15 +194,18 @@ final class Bridge {
         case .failed:
             status = "Can't reach \(peers[id ?? ""]?.name ?? host)"
         case .denied:
-            status = "PC is paired with another Mac"
+            status = "\(peers[id ?? ""]?.name ?? host) is paired with another computer"
         case .ok(let newLink, let size):
+            guard link == nil, incoming == nil else { newLink.finish(); break }   // something else won in the meantime
             link = newLink
+            connectedID = id ?? host
             connectedName = peers[id ?? ""]?.name ?? host
+            connectedPlatform = peers[id ?? ""]?.platform ?? "win"
             status = "Connected to \(connectedName!)"
-            learnSize(size)
-            newLink.send("hide")   // the PC's cursor stays out of sight until you cross over
+            learnSize(size, for: connectedID!)
+            newLink.send("hide")   // the other computer's cursor stays out of sight until you cross over
             pasteboardCount = NSPasteboard.general.changeCount   // only copies made from now on are shared
-            newLink.listen(onLine: { [weak self] in self?.received($0) }, onClose: { [weak self, weak newLink] in
+            newLink.listen(onLine: { [weak self] in self?.receivedFromTarget($0) }, onClose: { [weak self, weak newLink] in
                 guard let self, let newLink else { return }
                 self.closed(newLink)
             })
@@ -181,6 +218,7 @@ final class Bridge {
         guard link === closedLink else { return }
         link = nil
         connectedName = nil
+        connectedID = nil
         status = "Connection lost"
         if mode == .pc { leavePC(to: returnPoint) }
         lastAttempt = Date()
@@ -192,14 +230,44 @@ final class Bridge {
         if mode == .pc { leavePC(to: returnPoint) }
         link = nil
         connectedName = nil
+        connectedID = nil
         old.finish()
     }
 
-    private func learnSize(_ size: CGSize) {
-        guard size.width > 0, size.height > 0, size != pcSize else { return }
-        pcSize = size
-        defaults.set(size.width, forKey: "pcWidth")
-        defaults.set(size.height, forKey: "pcHeight")
+    private func learnSize(_ size: CGSize, for id: String) {
+        guard size.width > 0, size.height > 0, sizes[id] != size else { return }
+        sizes[id] = size
+        if let data = try? JSONEncoder().encode(sizes) { defaults.set(data, forKey: "sizes") }
+    }
+
+    // MARK: Being controlled
+
+    /// Another computer wants to control this Mac.
+    private func accepted(_ name: String, _ newLink: Link) {
+        incoming?.hangUp()
+        if link != nil || mode == .pc {   // one role at a time: stop controlling while we are controlled
+            paused = true
+            disconnect()
+        }
+        incoming = newLink
+        controllerName = name
+        status = "Controlled by \(name)"
+        pasteboardCount = NSPasteboard.general.changeCount
+        newLink.listen(onLine: { [weak self] in self?.receivedAsReceiver($0) }, onClose: { [weak self, weak newLink] in
+            guard let self, let newLink else { return }
+            self.controllerClosed(newLink)
+        })
+        onChange?()
+    }
+
+    private func controllerClosed(_ closedLink: Link) {
+        closedLink.finish()
+        guard incoming === closedLink else { return }
+        incoming = nil
+        controllerName = nil
+        receiver.reset()
+        status = "Looking for a computer…"
+        onChange?()
     }
 
     // MARK: Switching
@@ -247,7 +315,7 @@ final class Bridge {
     }
 
     /// A background app can't normally hide the cursor; this connection property allows it.
-    private func setCursorHidden(_ hide: Bool) {
+    func setCursorHidden(_ hide: Bool) {
         guard hide != cursorHidden else { return }
         cursorHidden = hide
         if hide {
@@ -268,30 +336,44 @@ final class Bridge {
         if mode == .pc { leavePC(to: returnPoint) }
         CGAssociateMouseAndMouseCursorPosition(1)
         setCursorHidden(false)
+        receiver.reset()
         link?.finish()
+        incoming?.finish()
     }
 
     // MARK: Clipboard
 
-    /// Text you copy here is sent to the PC. Copies marked as secret (password managers) are never sent.
+    /// Text you copy here is sent to the other computer, whichever way you are connected.
+    /// Copies marked as secret (password managers) are never sent.
     private func watchClipboard() {
         let board = NSPasteboard.general
         guard board.changeCount != pasteboardCount else { return }
         pasteboardCount = board.changeCount
         let types = board.types?.map(\.rawValue) ?? []
-        guard link != nil, !types.contains("org.nspasteboard.ConcealedType"), !types.contains("org.nspasteboard.TransientType"),
+        guard link != nil || incoming != nil, !types.contains("org.nspasteboard.ConcealedType"),
+              !types.contains("org.nspasteboard.TransientType"),
               let text = board.string(forType: .string), !text.isEmpty, text.utf8.count <= 256_000 else { return }
-        send("c " + Data(text.utf8).base64EncodedString())
+        let line = "c " + Data(text.utf8).base64EncodedString()
+        link?.send(line)
+        incoming?.send(line)
     }
 
-    /// Text copied on the PC arrives as "c <base64>".
-    private func received(_ line: String) {
+    /// Text copied on the other computer arrives as "c <base64>".
+    private func applyClipboard(_ line: String) {
         guard line.hasPrefix("c "), let data = Data(base64Encoded: String(line.dropFirst(2))),
               let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
         let board = NSPasteboard.general
         board.clearContents()
         board.setString(text.replacingOccurrences(of: "\r\n", with: "\n"), forType: .string)
         pasteboardCount = board.changeCount
+    }
+
+    /// Lines from the computer we are controlling: only clipboard text (and its heartbeat).
+    private func receivedFromTarget(_ line: String) { applyClipboard(line) }
+
+    /// Lines from the computer controlling us: clipboard text, or input to replay here.
+    private func receivedAsReceiver(_ line: String) {
+        if line.hasPrefix("c ") { applyClipboard(line) } else { receiver.handle(line) }
     }
 
     // MARK: Events
@@ -401,4 +483,3 @@ final class Bridge {
         }
     }
 }
-

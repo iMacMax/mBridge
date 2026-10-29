@@ -6,7 +6,8 @@ $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/iMacMax/mBridge/main/pc"
 $dir = Join-Path $env:LOCALAPPDATA "mBridge"
 $exe = Join-Path $dir "mBridge.exe"
-$source = Join-Path $dir "Program.cs"
+$files = "Program.cs", "Controller.cs", "Native.cs"
+$sources = $files | ForEach-Object { Join-Path $dir $_ }
 $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 
 New-Item -ItemType Directory -Force $dir | Out-Null
@@ -14,13 +15,15 @@ Get-Process mBridge -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
 # next to this script when run from a download, otherwise fetched from GitHub
-if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "Program.cs"))) {
-    Copy-Item (Join-Path $PSScriptRoot "Program.cs") $source -Force
-} else {
-    Invoke-WebRequest "$repo/Program.cs" -OutFile $source -UseBasicParsing
+foreach ($file in $files) {
+    if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot $file))) {
+        Copy-Item (Join-Path $PSScriptRoot $file) (Join-Path $dir $file) -Force
+    } else {
+        Invoke-WebRequest "$repo/$file" -OutFile (Join-Path $dir $file) -UseBasicParsing
+    }
 }
 
-& $csc /nologo /target:winexe /optimize "/out:$exe" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $source
+& $csc /nologo /target:winexe /optimize "/out:$exe" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $sources
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
 # lets the Mac reach this PC; skipped quietly when not running as administrator

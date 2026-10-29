@@ -110,7 +110,7 @@ final class ArrangeWindow: NSObject, NSWindowDelegate {
         panel.level = .floating
         panel.delegate = self
 
-        let hint = NSTextField(labelWithString: "Drag the PC to where it sits next to your Mac")
+        let hint = NSTextField(labelWithString: "Drag the other computer to where it sits next to this one")
         hint.font = .systemFont(ofSize: 13, weight: .medium)
         hint.alignment = .center
         hint.frame = NSRect(x: 0, y: 324, width: 520, height: 20)
